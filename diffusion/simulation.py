@@ -683,7 +683,7 @@ def create_publication_figure(results):
         ax_d.text(0.5, 0.5, 'Insufficient positive data for panel (d)', ha='center', va='center')
         ax_d.set_title(r'\textbf{(d)} Quadratic Speedup', y=1.05)
 
-    ax_d.set_xlabel(r'Baseline Rate $s(\mathcal{L}_O)$')
+    ax_d.set_xlabel(r'Singular Gap $s(\mathcal{L}_O)$')
     ax_d.set_ylabel(r'Max Lifted Rate $\nu_{\max}$')
     ax_d.legend(loc='lower right')
 
