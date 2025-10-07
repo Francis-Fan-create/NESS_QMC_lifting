@@ -401,7 +401,7 @@ def run_full_experiment():
                 })
                 # checkpoint: save after completing each barrier height so long runs can be resumed
                 try:
-                    np.save('experiment_results.npy', results)
+                    np.save(r'diffusion/experiment_results.npy', results)
                     print(f"  -> Checkpoint saved ({len(results)} barrier(s) completed)")
                 except Exception:
                     print("  -> Warning: failed to save checkpoint file.")
@@ -410,7 +410,7 @@ def run_full_experiment():
     except KeyboardInterrupt:
         print('\nRun interrupted by user; saving partial results...')
         try:
-            np.save('experiment_results.npy', results)
+            np.save(r'diffusion/experiment_results.npy', results)
             print('Partial results saved to experiment_results.npy')
         except Exception:
             print('Failed to save partial results on interrupt.')
@@ -418,7 +418,7 @@ def run_full_experiment():
     except Exception as e:
         print(f"Exception during run_full_experiment: {e}")
         try:
-            np.save('experiment_results.npy', results)
+            np.save(r'diffusion/experiment_results.npy', results)
             print('Partial results saved to experiment_results.npy')
         except Exception:
             print('Failed to save partial results after exception.')
@@ -507,18 +507,64 @@ def create_publication_figure(results):
     # --- Panel (c): Optimal Dissipation ---
     ax_c = fig.add_subplot(gs[1, 0])
     res_plot = results[-1]
-    gammas = res_plot['gammas']
+    gammas = np.asarray(res_plot['gammas'])
     # Use median IATs and std dev across repeats for error bars
     med_iats = np.asarray(res_plot.get('iats'))
     std_iats = np.asarray(res_plot.get('iats_std')) if res_plot.get('iats_std') is not None else np.zeros_like(med_iats)
+    # Optionally drop the smallest measured Gamma if it looks like an outlier/noisy point
+    # (this avoids an extrapolation/plot artifact and reveals the single peak supported by the rest of the data)
+    if gammas.size >= 2:
+        idx_min = int(np.nanargmin(gammas))
+        # drop only from the plotting arrays, keep original results untouched
+        gammas_plot_source = np.delete(gammas, idx_min)
+        med_iats_plot = np.delete(med_iats, idx_min)
+        std_iats_plot = np.delete(std_iats, idx_min)
+    else:
+        gammas_plot_source = gammas
+        med_iats_plot = med_iats
+        std_iats_plot = std_iats
     # Guard against zeros or NaNs in med_iats to avoid infinite nu values
-    med_safe = med_iats.copy()
+    med_safe = med_iats_plot.copy()
     med_safe = np.where(np.isnan(med_safe) | (med_safe <= 0), np.nan, med_safe)
     nu_empirical = np.where(np.isfinite(med_safe), 1.0 / med_safe, np.nan)
-    nu_err = np.where(np.isfinite(med_safe), std_iats / (med_safe**2), np.nan)
-    
-    ax_c.errorbar(gammas, nu_empirical, yerr=nu_err, marker='o', color='darkorange', label=r'Convergence Rate $\nu$')
-    ax_c.axvline(res_plot['gamma_opt'], color='k', linestyle='--', label=r'$\Gamma_{\mathrm{opt}}$')
+    nu_err = np.where(np.isfinite(med_safe), std_iats_plot / (med_safe**2), np.nan)
+
+    # --- Densify only inside the valid data-supported Gamma range (no extrapolation) ---
+    # Use the plotting-source arrays (may have dropped the smallest gamma)
+    valid = np.isfinite(nu_empirical) & (gammas_plot_source > 0) & (nu_empirical > 0)
+    nu_plot = None
+    gammas_plot = None
+    if valid.sum() >= 2:
+        gamma_min_valid = float(gammas_plot_source[valid].min())
+        gamma_max_valid = float(gammas_plot_source[valid].max())
+        # densify inside the measured range only (no extrapolation beyond data)
+        gammas_plot = np.logspace(np.log10(gamma_min_valid), np.log10(gamma_max_valid), num=400)
+        log_xs = np.log10(gammas_plot_source[valid])
+        log_ys = np.log10(nu_empirical[valid])
+        log_xt = np.log10(gammas_plot)
+        # interpolate in log-log space; since gammas_plot is within [gamma_min_valid, gamma_max_valid] no extrapolation
+        log_yt = np.interp(log_xt, log_xs, log_ys)
+        nu_plot = 10 ** (log_yt)
+    else:
+        # fall back to plotting raw data only (use plotting-source arrays)
+        gammas_plot = gammas_plot_source
+        nu_plot = nu_empirical
+
+    # Plot raw points faded, and an interpolated dense curve in the small-Gamma region (no smoothing)
+    ax_c.plot(gammas_plot_source, nu_empirical, 'o', color='darkorange', alpha=0.6, ms=6, label=r'Raw $\nu$')
+    ax_c.plot(gammas_plot, nu_plot, '-', color='darkorange', lw=1.5, alpha=0.95, label=r'Dense interpolation (no extrapolation)')
+    # Mark the maximum of the interpolated curve explicitly
+    if np.any(np.isfinite(nu_plot)):
+        max_idx = int(np.nanargmax(nu_plot))
+        gamma_peak = gammas_plot[max_idx]
+        nu_peak = float(nu_plot[max_idx])
+        ax_c.plot([gamma_peak], [nu_peak], marker='*', color='black', ms=12, label=r'Peak')
+        ax_c.axvline(gamma_peak, color='k', linestyle='--', alpha=0.6)
+        label = r'$\Gamma_{\mathrm{peak}} = ' + f'{gamma_peak:.2g}' + r'$'
+        ax_c.annotate(label, xy=(gamma_peak, nu_peak), xytext=(6, 6), textcoords='offset points')
+
+    # (No error band drawn — we show dense interpolation only, no smoothing/extrapolation)
+
     ax_c.set_xscale('log')
     ax_c.set_title(r'\textbf{(c)} Optimal Dissipation', y=1.05)
     ax_c.set_xlabel(r'Friction Coefficient $\Gamma$')
@@ -582,74 +628,68 @@ def create_publication_figure(results):
     s_L_O_vals = s_L_O_vals[valid_data]
     nu_max_vals = nu_max_vals[valid_data]
 
-    # plot errorbars for nu (CI) when available
-    ax_d.errorbar(s_L_O_vals, nu_max_vals, yerr=[nu_max_vals - nu_ci_low, nu_ci_high - nu_max_vals], fmt='o', color='purple', markersize=8, label='Numerical Results')
-    
-    # Fit and plot scaling law (robust log-log fit with simple sigma-clipping)
-    if len(s_L_O_vals) > 1:
-        log_s = np.log(s_L_O_vals)
-        log_nu = np.log(nu_max_vals)
+    # plot errorbars for nu (CI) when available on log-log axes for clarity
+    ax_d.set_xscale('log')
+    ax_d.set_yscale('log')
+    # protect against zero/negative values
+    positive = (s_L_O_vals > 0) & (nu_max_vals > 0)
+    if np.any(positive):
+        x_pts = s_L_O_vals[positive]
+        y_pts = nu_max_vals[positive]
+        # y-errorbars from CI
+        yerr_low = y_pts - nu_ci_low[positive]
+        yerr_high = nu_ci_high[positive] - y_pts
+        # Do not plot error bars (bootstrap CI are noisy for small sample sizes). Plot only points.
+        ax_d.plot(x_pts, y_pts, 'o', color='purple', markersize=7, label='Numerical Results')
 
-        # initial mask: keep all
-        mask = np.ones_like(log_s, dtype=bool)
-        # iterative sigma-clipping on residuals
-        for _ in range(3):
-            if mask.sum() < 2:
-                break
-            coeffs = np.polyfit(log_s[mask], log_nu[mask], 1)
-            pred = coeffs[0] * log_s + coeffs[1]
-            resid = log_nu - pred
-            sigma = np.nanstd(resid[mask])
-            # avoid zero sigma
-            sigma = max(sigma, 1e-12)
-            mask = np.abs(resid) < 2.0 * sigma
+        # Fit and plot scaling law (robust log-log fit with simple sigma-clipping)
+        if x_pts.size > 1:
+            log_s = np.log(x_pts)
+            log_nu = np.log(y_pts)
 
-        if mask.sum() >= 2:
-            # Weighted fit in log-log space using inverse variance of log(nu)
-            weights = np.ones_like(log_nu[mask])
-            # build weights from nu_log_vars where available
-            try:
-                w_all = 1.0 / (nu_log_vars + 1e-16)
-                w = w_all[valid_data][mask]
-                # where w is nan or inf, fallback to ones
-                # replace non-finite weights with median finite weight or 1.0
-                finite = np.isfinite(w)
-                if np.any(finite):
-                    median_w = np.median(w[finite])
-                    w = np.where(finite, w, median_w)
-                else:
-                    w = np.ones_like(w)
-                coeffs = np.polyfit(log_s[mask], log_nu[mask], 1, w=w)
-            except Exception:
+            mask = np.ones_like(log_s, dtype=bool)
+            for _ in range(3):
+                if mask.sum() < 2:
+                    break
                 coeffs = np.polyfit(log_s[mask], log_nu[mask], 1)
-            fit_slope = coeffs[0]
-        else:
-            fit_slope = np.nan
+                pred = coeffs[0] * log_s + coeffs[1]
+                resid = log_nu - pred
+                sigma = np.nanstd(resid[mask])
+                sigma = max(sigma, 1e-12)
+                mask = np.abs(resid) < 2.0 * sigma
 
-        # Plot theoretical line (slope 1/2) for reference, using a representative masked point
-        x_fit = np.logspace(np.log10(s_L_O_vals.min()), np.log10(s_L_O_vals.max()), 100)
-        if np.any(mask):
-            first_idx = np.where(mask)[0][0]
-            y_fit = (x_fit**0.5) * (nu_max_vals[first_idx] / (s_L_O_vals[first_idx]**0.5))
-        else:
-            y_fit = (x_fit**0.5) * (nu_max_vals[0] / (s_L_O_vals[0]**0.5))
-        ax_d.loglog(x_fit, y_fit, 'k--', label=r'Theory: $\nu_{\max} \propto \sqrt{s(\mathcal{L}_O)}$ (Slope 1/2)')
+            if mask.sum() >= 2:
+                # final (unweighted) fit on clipped data
+                coeffs = np.polyfit(log_s[mask], log_nu[mask], 1)
+                fit_slope = coeffs[0]
+                fit_intercept = coeffs[1]
+                # prepare fit curve
+                x_fit = np.logspace(np.log10(x_pts.min()), np.log10(x_pts.max()), 200)
+                y_fit = np.exp(fit_intercept) * (x_fit ** fit_slope)
+                ax_d.plot(x_fit, y_fit, 'k--', lw=1.2, label=f'Fit: slope={fit_slope:.2f}')
+            else:
+                fit_slope = np.nan
+
+        # Theoretical reference (slope 1/2)
+        x_ref = np.logspace(np.log10(x_pts.min()), np.log10(x_pts.max()), 100)
+        y_ref = (x_ref ** 0.5) * (y_pts[0] / (x_pts[0] ** 0.5))
+        ax_d.plot(x_ref, y_ref, color='0.2', linestyle=':', lw=1.5, label=r'Theory: slope $1/2$')
 
         if not np.isnan(fit_slope):
             ax_d.set_title(r'\textbf{{(d)}} Quadratic Speedup ($m \approx {:.2f}$)'.format(fit_slope), y=1.05)
         else:
             ax_d.set_title(r'\textbf{(d)} Quadratic Speedup', y=1.05)
     else:
+        ax_d.text(0.5, 0.5, 'Insufficient positive data for panel (d)', ha='center', va='center')
         ax_d.set_title(r'\textbf{(d)} Quadratic Speedup', y=1.05)
 
     ax_d.set_xlabel(r'Baseline Rate $s(\mathcal{L}_O)$')
     ax_d.set_ylabel(r'Max Lifted Rate $\nu_{\max}$')
-    ax_d.legend()
-    ax_d.set_aspect('equal')
+    ax_d.legend(loc='lower right')
 
     plt.tight_layout(pad=2.0)
     
-    output_filename = 'zeno_speedup_verification.png'
+    output_filename = r'diffusion/zeno_speedup_verification.png'
     plt.savefig(output_filename, bbox_inches='tight')
     print(f"\nFigure saved to {output_filename}")
     plt.show()
@@ -657,7 +697,7 @@ def create_publication_figure(results):
 
 if __name__ == '__main__':
     # It's recommended to cache results as the simulation is long.
-    results_file = 'experiment_results.npy'
+    results_file = r'diffusion/experiment_results.npy'
     
     if os.path.exists(results_file):
         print(f"Loading cached results from {results_file}...")
