@@ -689,7 +689,7 @@ def create_publication_figure(results):
 
     plt.tight_layout(pad=2.0)
     
-    output_filename = r'diffusion/zeno_speedup_verification.png'
+    output_filename = r'diffusion/diffusion_speedup_verification.png'
     plt.savefig(output_filename, bbox_inches='tight')
     print(f"\nFigure saved to {output_filename}")
     plt.show()
