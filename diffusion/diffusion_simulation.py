@@ -353,7 +353,7 @@ def run_full_experiment():
             TOTAL_SIM_TIME = N_STEPS_IAT * SIM_DT
             BURN_TIME = N_BURN_IN * SIM_DT
 
-            for gamma in tqdm(gamma_values, desc=f"  Scanning Gamma (h_b={h_b})"):
+            for gamma in tqdm(gamma_values, desc=f"  Scanning gamma (h_b={h_b})"):
                 # choose a safe dt for the given gamma to resolve OU step; don't exceed SIM_DT
                 if gamma > 0:
                     dt_gamma = min(SIM_DT, 0.1 / gamma)
@@ -386,7 +386,7 @@ def run_full_experiment():
                 # Convergence rate is proportional to 1/IAT (use median-based value)
                 nu_max = 1.0 / iat_min
 
-                print(f"  -> Optimal Gamma = {gamma_opt:.3f}, Min median IAT = {iat_min:.3f}")
+                print(f"  -> Optimal gamma = {gamma_opt:.3f}, Min median IAT = {iat_min:.3f}")
 
                 results.append({
                     "h_b": h_b,
@@ -511,7 +511,7 @@ def create_publication_figure(results):
     # Use median IATs and std dev across repeats for error bars
     med_iats = np.asarray(res_plot.get('iats'))
     std_iats = np.asarray(res_plot.get('iats_std')) if res_plot.get('iats_std') is not None else np.zeros_like(med_iats)
-    # Optionally drop the smallest measured Gamma if it looks like an outlier/noisy point
+    # Optionally drop the smallest measured gamma if it looks like an outlier/noisy point
     # (this avoids an extrapolation/plot artifact and reveals the single peak supported by the rest of the data)
     if gammas.size >= 2:
         idx_min = int(np.nanargmin(gammas))
@@ -529,7 +529,7 @@ def create_publication_figure(results):
     nu_empirical = np.where(np.isfinite(med_safe), 1.0 / med_safe, np.nan)
     nu_err = np.where(np.isfinite(med_safe), std_iats_plot / (med_safe**2), np.nan)
 
-    # --- Densify only inside the valid data-supported Gamma range (no extrapolation) ---
+    # --- Densify only inside the valid data-supported gamma range (no extrapolation) ---
     # Use the plotting-source arrays (may have dropped the smallest gamma)
     valid = np.isfinite(nu_empirical) & (gammas_plot_source > 0) & (nu_empirical > 0)
     nu_plot = None
@@ -550,7 +550,7 @@ def create_publication_figure(results):
         gammas_plot = gammas_plot_source
         nu_plot = nu_empirical
 
-    # Plot raw points faded, and an interpolated dense curve in the small-Gamma region (no smoothing)
+    # Plot raw points faded, and an interpolated dense curve in the small-gamma region (no smoothing)
     ax_c.plot(gammas_plot_source, nu_empirical, 'o', color='darkorange', alpha=0.6, ms=6, label=r'Raw $\nu$')
     ax_c.plot(gammas_plot, nu_plot, '-', color='darkorange', lw=1.5, alpha=0.95, label=r'Dense interpolation (no extrapolation)')
     # Mark the maximum of the interpolated curve explicitly
@@ -560,14 +560,14 @@ def create_publication_figure(results):
         nu_peak = float(nu_plot[max_idx])
         ax_c.plot([gamma_peak], [nu_peak], marker='*', color='black', ms=12, label=r'Peak')
         ax_c.axvline(gamma_peak, color='k', linestyle='--', alpha=0.6)
-        label = r'$\Gamma_{\mathrm{peak}} = ' + f'{gamma_peak:.2g}' + r'$'
+        label = r'$\gamma_{\mathrm{peak}} = ' + f'{gamma_peak:.2g}' + r'$'
         ax_c.annotate(label, xy=(gamma_peak, nu_peak), xytext=(6, 6), textcoords='offset points')
 
     # (No error band drawn — we show dense interpolation only, no smoothing/extrapolation)
 
     ax_c.set_xscale('log')
     ax_c.set_title(r'\textbf{(c)} Optimal Dissipation', y=1.05)
-    ax_c.set_xlabel(r'Friction Coefficient $\Gamma$')
+    ax_c.set_xlabel(r'Friction Coefficient $\gamma$')
     ax_c.set_ylabel(r'Convergence Rate $\nu \propto 1/\tau_x$')
     ax_c.legend()
 
@@ -683,8 +683,8 @@ def create_publication_figure(results):
         ax_d.text(0.5, 0.5, 'Insufficient positive data for panel (d)', ha='center', va='center')
         ax_d.set_title(r'\textbf{(d)} Quadratic Speedup', y=1.05)
 
-    ax_d.set_xlabel(r'Singular Gap $s(\mathcal{L}_O)$')
-    ax_d.set_ylabel(r'Max Lifted Rate $\nu_{\max}$')
+    ax_d.set_xlabel(r'Singular Gap $s(L_O)$')
+    ax_d.set_ylabel(r'Max Lifted Rate $\nu_{opt}$')
     ax_d.legend(loc='lower right')
 
     plt.tight_layout(pad=2.0)
