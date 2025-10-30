@@ -613,7 +613,7 @@ def create_publication_figure(results):
         nu_peak = float(nu_plot[max_idx])
         ax_c.plot([gamma_peak], [nu_peak], marker='*', color='black', ms=12, label=r'Peak')
         ax_c.axvline(gamma_peak, color='k', linestyle='--', alpha=0.6)
-        label = r'$\gamma_{\mathrm{peak}} = ' + f'{gamma_peak:.2g}' + r'$'
+        label = r'$\gamma_{\mathrm{opt}} = ' + f'{gamma_peak:.2g}' + r'$'
         ax_c.annotate(label, xy=(gamma_peak, nu_peak), xytext=(6, 6), textcoords='offset points')
 
     # (No error band drawn — we show dense interpolation only, no smoothing/extrapolation)
