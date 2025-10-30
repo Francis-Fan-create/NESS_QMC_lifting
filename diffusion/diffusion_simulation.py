@@ -245,6 +245,24 @@ def run_simulation(n_steps, dt, gamma, h_b, initial_q):
         
     return traj_x
 
+
+@numba.njit
+def run_overdamped_sim(n_steps, dt, h_b, q0):
+    """Runs an overdamped Euler-Maruyama simulation and returns the x-coordinate trajectory.
+
+    This top-level function mirrors the small nested version used for plotting but is
+    placed at module scope so it can be JIT-compiled and reused for IAT estimation.
+    """
+    q = q0.copy()
+    traj_x = np.empty(n_steps)
+    for i in range(n_steps):
+        gradU_x, gradU_y = grad_potential(q[0], q[1], h_b)
+        Fx, Fy = non_conservative_force(q[0], q[1])
+        q[0] += dt * (gradU_x + Fx) + np.sqrt(2.0 / BETA * dt) * np.random.normal()
+        q[1] += dt * (gradU_y + Fy) + np.sqrt(2.0 / BETA * dt) * np.random.normal()
+        traj_x[i] = q[0]
+    return traj_x
+
 # --- 4. Analysis: Integrated Autocorrelation Time ---
 
 def integrated_autocorrelation_time(x, c=5):
@@ -454,55 +472,90 @@ def create_publication_figure(results):
     ax_a.set_ylabel(r'$y$')
     ax_a.set_aspect('equal')
 
-    # --- Panel (b): Trajectories ---
+    # --- Panel (b): Direct comparison of convergence rates (Collapsed vs Lifted) ---
+    # We compute (or use cached) nu_collapsed = 1 / IAT_overdamped and compare to
+    # the optimal lifted rate nu_opt (already stored as 'nu_max' per result). Both are
+    # computed using the same IAT estimator for consistency.
     ax_b = fig.add_subplot(gs[0, 1])
-    # Simulation for plotting trajectories
-    n_steps_traj = 50000
-    dt_traj = 0.05
-    initial_q_traj = np.array([-1.0, 0.0])
-    
-    # Overdamped (Euler-Maruyama)
-    @numba.njit
-    def run_overdamped(n_steps, dt, h_b, q0):
-        q = q0.copy()
-        traj_x = np.empty(n_steps)
-        for i in range(n_steps):
-            gradU_x, gradU_y = grad_potential(q[0], q[1], h_b)
-            Fx, Fy = non_conservative_force(q[0], q[1])
-            q[0] += dt * (gradU_x + Fx) + np.sqrt(2.0 / BETA * dt) * np.random.normal()
-            q[1] += dt * (gradU_y + Fy) + np.sqrt(2.0 / BETA * dt) * np.random.normal()
-            traj_x[i] = q[0]
-        return traj_x
-        
-    traj_overdamped = run_overdamped(n_steps_traj, dt_traj, h_b_plot, initial_q_traj)
-    
-    # Optimally lifted
-    gamma_opt_plot = results[-1]['gamma_opt']
-    traj_lifted = run_simulation(n_steps_traj, dt_traj, gamma_opt_plot, h_b_plot, initial_q_traj)
 
-    time_axis = np.arange(n_steps_traj) * dt_traj
-    # Subsample raw traces for clarity and overlay a smoothed curve (EMA)
-    subsample = max(1, n_steps_traj // 2000)
-    ax_b.plot(time_axis[::subsample], traj_overdamped[::subsample], label='Overdamped (Slow)', color='royalblue', lw=0.6, alpha=0.6)
-    ax_b.plot(time_axis[::subsample], traj_lifted[::subsample], label='Optimally Lifted (Fast)', color='crimson', lw=0.6, alpha=0.6)
+    quick_flag = os.environ.get('ZENO_QUICK', '0') == '1'
+    # Simulation defaults mirror the main experiment; quick mode uses smaller work.
+    SIM_DT = 0.01
+    N_STEPS_IAT = 20000 if quick_flag else 2_000_000
+    N_BURN_IN = 2000 if quick_flag else 100_000
+    REPEATS = 6 if quick_flag else 3
+    TOTAL_SIM_TIME = N_STEPS_IAT * SIM_DT
 
-    # Exponential moving average smoothing for visualization
-    def ema(x, alpha=0.01):
-        s = np.empty_like(x)
-        s[0] = x[0]
-        for i in range(1, len(x)):
-            s[i] = alpha * x[i] + (1 - alpha) * s[i-1]
-        return s
+    # Compute nu_collapsed for each barrier if missing; cache into results to avoid recompute.
+    for r in results:
+        if ('nu_collapsed' in r) and (r['nu_collapsed'] is not None) and (not np.isnan(r['nu_collapsed'])):
+            continue
 
-    ax_b.plot(time_axis, ema(traj_overdamped), color='royalblue', lw=1.2, alpha=0.9)
-    ax_b.plot(time_axis, ema(traj_lifted), color='crimson', lw=1.2, alpha=0.9)
-    ax_b.set_title(r'\textbf{(b)} Convergence Trajectories', y=1.05)
-    ax_b.set_xlabel(r'Time')
-    ax_b.set_ylabel(r'$x$-coordinate')
-    ax_b.legend(loc='upper right')
-    ax_b.set_ylim(-1.8, 1.8)
-    ax_b.axhline(-1, color='k', linestyle='--', alpha=0.5)
-    ax_b.axhline(1, color='k', linestyle='--', alpha=0.5)
+        h_b_val = r['h_b']
+        print(f"Computing overdamped IAT for collapsed system (h_b={h_b_val}) using {N_STEPS_IAT} steps x dt={SIM_DT}...")
+        n_steps = max(int(np.ceil(TOTAL_SIM_TIME / SIM_DT)), 10)
+        # N_BURN_IN is a number of steps (already in the script's convention).
+        # Use burn_steps = min(N_BURN_IN, n_steps-1) to avoid converting by dt.
+        burn_steps = min(int(N_BURN_IN), n_steps - 1)
+
+        iats_repeats = []
+        for rep in range(REPEATS):
+            traj = run_overdamped_sim(n_steps, SIM_DT, h_b_val, np.array([-1.0, 0.0]))
+            iat = integrated_autocorrelation_time(traj[burn_steps:])
+            iats_repeats.append(iat)
+
+        iats_repeats = np.array(iats_repeats)
+        med = float(np.nanmedian(iats_repeats)) if iats_repeats.size > 0 else np.nan
+        std = float(np.nanstd(iats_repeats)) if iats_repeats.size > 0 else np.nan
+        nu_collapsed = 1.0 / med if (med is not None and not np.isnan(med) and med > 0) else np.nan
+        r['nu_collapsed'] = nu_collapsed
+        r['nu_collapsed_iats'] = iats_repeats.tolist()
+        r['nu_collapsed_iat_median'] = med
+        r['nu_collapsed_iat_std'] = std
+        # Save back to disk to cache heavy computation
+        try:
+            np.save(r'diffusion/experiment_results.npy', results)
+            print(f"  -> Cached nu_collapsed for h_b={h_b_val}")
+        except Exception:
+            print("  -> Warning: failed to cache updated results file for nu_collapsed.")
+
+    # Gather arrays for plotting
+    hb_vals = np.array([r['h_b'] for r in results])
+    nu_collapsed_vals = np.array([r.get('nu_collapsed', np.nan) for r in results])
+    nu_opt_vals = np.array([r.get('nu_max', np.nan) for r in results])
+
+    # Filter valid positive values
+    valid = np.isfinite(nu_collapsed_vals) & np.isfinite(nu_opt_vals) & (nu_collapsed_vals > 0) & (nu_opt_vals > 0)
+    if np.any(valid):
+        x = nu_collapsed_vals[valid]
+        y = nu_opt_vals[valid]
+        hbs = hb_vals[valid]
+
+        ax_b.set_xscale('log')
+        ax_b.set_yscale('log')
+        ax_b.plot(x, y, 'o', color='tab:blue', ms=8, label='Data (annotated: $h_b$)')
+        # identity line
+        lims = [min(x.min(), y.min()) * 0.8, max(x.max(), y.max()) * 1.2]
+        ax_b.plot(lims, lims, '--', color='0.3', lw=1, label=r'Identity $y=x$')
+        # annotate points with barrier heights
+        for xi, yi, hb in zip(x, y, hbs):
+            ax_b.annotate(f"{hb:.1f}", xy=(xi, yi), xytext=(4, 4), textcoords='offset points', fontsize=10)
+
+        ax_b.set_xlim(lims)
+        ax_b.set_ylim(lims)
+        ax_b.set_xlabel(r'Collapsed rate $\nu(L_O)$')
+        ax_b.set_ylabel(r'Optimally lifted rate $\nu_{\mathrm{opt}}(L)$')
+        ax_b.set_title(r'\textbf{(b)} Collapsed vs Lifted Convergence Rates', y=1.05)
+        ax_b.grid(True, which='both', ls=':', alpha=0.4)
+        # show ratio as text
+        ratios = y / x
+        median_ratio = np.nanmedian(ratios)
+        ax_b.text(0.05, 0.95, f'Median speedup: {median_ratio:.2f}x', transform=ax_b.transAxes, ha='left', va='top', fontsize=11)
+        # Legend explaining the annotation on each plotted point
+        ax_b.legend(loc='lower right', fontsize=11)
+    else:
+        ax_b.text(0.5, 0.5, 'Insufficient data to compare rates', ha='center', va='center')
+        ax_b.set_title(r'\textbf{(b)} Collapsed vs Lifted Convergence Rates', y=1.05)
 
     # --- Panel (c): Optimal Dissipation ---
     ax_c = fig.add_subplot(gs[1, 0])
