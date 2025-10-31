@@ -811,7 +811,7 @@ def create_publication_figure(results):
         ax_a.text2D(
             0.02,
             0.78,
-            f"NESS current $J = {panel_a_data['current']:+.3e}$\n$\\gamma_{{opt}}={panel_a_data['gamma_opt']:.2f}$",
+            f"NESS current$= {panel_a_data['current']:+.3e}$\n$\\gamma_{{opt}}={panel_a_data['gamma_opt']:.2f}$",
             transform=ax_a.transAxes,
             ha='left',
             fontsize=10
