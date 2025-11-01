@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import math
 import numpy as np
 import qutip as qt
 try:
@@ -65,9 +66,9 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-COLLAPSED_RATE_DISPLAY_FLOOR = 1e-2  # Display floor for collapsed IAT rates (log-scale stability)
-LIFTED_IAT_REPEATS = 5               # QJMC repeats per Gamma for the lifted model
-COLLAPSED_IAT_REPEATS = 5            # MC repeats for the collapsed model
+COLLAPSED_RATE_DISPLAY_FLOOR = 1e-2  # Display floor for collapsed rates (log-scale stability)
+LIFTED_IAT_REPEATS = 5               # QJMC repeats per Gamma for the lifted-model rate estimator
+COLLAPSED_IAT_REPEATS = 5            # MC repeats for the collapsed-model rate estimator
 S_LO_SIM_SCALE = 1e4                 # Uniformly rescale L_O to lift gaps toward ~1e-10
 RATE_RENORMALIZATION = S_LO_SIM_SCALE
 S_LO_DISPLAY_SCALE = 1.0             # Keep panel (d) on the true scale post-renormalization
@@ -271,31 +272,25 @@ def get_base_L_O_and_gap(N, J, D):
     return L_O, gap_O, w_du, w_ud
 
 # ---
-# NEW METRIC: Integrated Autocorrelation Time (IAT)
+# Correlation Diagnostics
 # ---
 
 def integrated_autocorrelation_time(x, c=5):
-    """
-    Calculates the Integrated Autocorrelation Time (IAT) of a time series.
-    Uses the methodology from the emcee package (via the classical code).
-    """
-    # Ensure the series is long enough
+    """Legacy IAT estimator retained for backward compatibility."""
     if len(x) < 2 * c:
         return np.nan
 
-    # Calculate autocorrelation function using FFT
     n = len(x)
     x = np.asarray(x, dtype=float)
     x_demeaned = x - np.mean(x)
-    f = np.fft.fft(x_demeaned, n=2*n)
+    f = np.fft.fft(x_demeaned, n=2 * n)
     acf = np.fft.ifft(f * np.conj(f))[:n].real
-    
-    if acf[0] < 1e-10: # Handle zero variance
-        return 1.0
-        
+
+    if acf[0] <= 0:
+        return np.nan
+
     acf /= acf[0]
 
-    # Use the initial positive sequence / pairwise summation
     try:
         g = acf[1:]
         if g.size < 1:
@@ -319,29 +314,99 @@ def integrated_autocorrelation_time(x, c=5):
     except Exception:
         return np.nan
 
-def get_iat_rate_from_L(H, c_ops, J_val, D_val):
+
+def estimate_acf_decay_rate(x, dt, tail_fraction=0.35, min_tail_points=12, eps=1e-8):
+    """Estimate an exponential decay rate from the log-envelope of the ACF tail.
+
+    The tail window adapts to the amount of usable correlation data so that fast
+    decays (few significant samples) still produce a meaningful slope while
+    longer correlations continue to use the far-tail statistics.
     """
-    Runs a QJMC simulation to find the IAT of the "slow" observable
-    sigma_z on the inner spin.
-    
-    Returns nu_eff = 1 / (2 * tau_IAT)
-    """
+
+    x = np.asarray(x, dtype=float)
+    if x.size < 3 or dt <= 0:
+        return np.nan
+
+    x_centered = x - np.mean(x)
+    n = x_centered.size
+    f = np.fft.fft(x_centered, n=2 * n)
+    acf = np.fft.ifft(f * np.conj(f))[:n].real
+    if acf[0] == 0:
+        return np.nan
+    acf /= acf[0]
+
+    lags = np.arange(n) * dt
+    acf_tail = acf[1:]
+    lag_tail = lags[1:]
+
+    valid = np.isfinite(acf_tail) & (np.abs(acf_tail) > eps)
+    valid_count = int(valid.sum())
+    if valid_count < max(min_tail_points, 5):
+        return np.nan
+
+    acf_valid = acf_tail[valid]
+    lag_valid = lag_tail[valid]
+
+    tail_fraction = float(np.clip(tail_fraction, 1e-3, 1.0))
+    tail_len = max(min_tail_points, int(np.ceil(tail_fraction * valid_count)))
+    tail_len = min(tail_len, valid_count)
+    if tail_len < 2:
+        return np.nan
+
+    acf_tail = acf_valid[-tail_len:]
+    lag_tail = lag_valid[-tail_len:]
+
+    if acf_tail.size < 2:
+        return np.nan
+
+    log_env = np.log(np.abs(acf_tail))
+    try:
+        slope, _ = np.polyfit(lag_tail, log_env, 1)
+    except np.linalg.LinAlgError:
+        return np.nan
+
+    nu = -float(slope)
+    if not np.isfinite(nu) or nu <= 0:
+        return np.nan
+    return nu
+
+
+def get_iat_rate_from_L(H, c_ops, J_val, D_val, Gamma_val=None):
+    """Estimate the decay rate of the slow observable via the ACF tail method."""
     N = 3
     
     # --- 1. Define Simulation Parameters ---
-    # Timescale is roughly 1/(J^2 + D^2).
-    t_scale = 1.0 / (J_val**2 + D_val**2 + 1e-3)
-    T_sim = 2000.0 * t_scale  # Total simulation time
-    N_t = 10000              # Number of time steps
-    times = np.linspace(0, T_sim, N_t)
-    dt = times[1] - times[0]
+    base_rate = J_val**2 + D_val**2 + 1e-3
+    lift_rate = base_rate + max(Gamma_val or 0.0, 0.0)
+
+    target_dt = min(0.05 / lift_rate, 0.015)
+    target_dt = max(target_dt, 1e-3)
+
+    T_slow = 80.0 / base_rate
+    T_fast = 40.0 / lift_rate
+    T_sim = max(T_slow, T_fast)
+
+    N_T_MIN = 6000
+    N_T_MAX = 120000
+    N_t = int(np.ceil(T_sim / target_dt)) + 1
+    if N_t > N_T_MAX:
+        target_dt = T_sim / (N_T_MAX - 1)
+        N_t = N_T_MAX
+    elif N_t < N_T_MIN:
+        target_dt = T_sim / (N_T_MIN - 1)
+        N_t = N_T_MIN
+
+    T_sim = target_dt * (N_t - 1)
+    times = np.linspace(0.0, T_sim, N_t)
+    dt = target_dt
     
     # --- 2. Define Initial State and Observable ---
     psi0 = qt.tensor(qt.basis(2, 1), qt.basis(2, 1), qt.basis(2, 0)) # |v, v, ^>
     obs = tensor_op(sz, N, 1) # sigma_z on the middle spin
     
     # --- 3. Run QJMC Simulation ---
-    options = qt.Options(store_states=False, store_final_state=False, nsteps=10000)
+    max_nsteps = max(10000, int(1.5 * N_t))
+    options = qt.Options(store_states=False, store_final_state=False, nsteps=max_nsteps)
     # options.use_sparse = True # This may or may not be supported/needed.
     try:
         result = qt.mcsolve(H, psi0, times, c_ops, [obs], ntraj=1, options=options)
@@ -350,28 +415,18 @@ def get_iat_rate_from_L(H, c_ops, J_val, D_val):
         print(f"Warning: mcsolve failed ({e}). Returning NaN.")
         return np.nan
     
-    # --- 4. Compute IAT ---
-    burn_in_idx = N_t // 5
+    # --- 4. Estimate decay rate ---
+    burn_in_idx = min(N_t // 5, N_t - 50)
     obs_ts_stable = obs_ts[burn_in_idx:]
-    
-    tau_iat_steps = integrated_autocorrelation_time(obs_ts_stable)
-    
-    tau_iat_time = tau_iat_steps * dt
-    
-    if np.isnan(tau_iat_time) or tau_iat_time < dt:
-        return np.nan 
 
-    # The effective rate is 1 / (2 * tau_IAT)
-    # This maps the IAT to the exponential decay rate nu.
-    nu_eff = 1.0 / (2.0 * tau_iat_time)
+    nu_est = estimate_acf_decay_rate(obs_ts_stable, dt)
+    if not np.isfinite(nu_est) or nu_est <= 0:
+        return np.nan
 
-    return nu_eff * RATE_RENORMALIZATION
+    return float(nu_est) * RATE_RENORMALIZATION
 
 def get_iat_rate_from_L_O(L_O, rng_seed=None):
-    """
-    Runs a Monte Carlo unraveling of the collapsed two-state dynamics defined by L_O
-    and returns the effective IAT rate, using the same observable and estimator
-    employed for the lifted model.
+    """Estimate the decay rate of the collapsed dynamics via the ACF tail method.
 
     Parameters
     ----------
@@ -417,21 +472,18 @@ def get_iat_rate_from_L_O(L_O, rng_seed=None):
         if rng_state is not None:
             np.random.set_state(rng_state)
         
-    # --- 5. Compute IAT ---
+    # --- 5. Estimate decay rate ---
     burn_in_idx = N_t // 5
     obs_ts_stable = obs_ts[burn_in_idx:]
-    
-    tau_iat_steps = integrated_autocorrelation_time(obs_ts_stable)
-    tau_iat_time = tau_iat_steps * dt
-    
-    if np.isnan(tau_iat_time) or tau_iat_time < dt:
+
+    nu_est = estimate_acf_decay_rate(obs_ts_stable, dt)
+    if not np.isfinite(nu_est) or nu_est <= 0:
         return np.nan
 
-    nu_eff = 1.0 / (2.0 * tau_iat_time)
-    return nu_eff * RATE_RENORMALIZATION
+    return float(nu_est) * RATE_RENORMALIZATION
 
 
-def estimate_collapsed_iat_rate(L_O, repeats=COLLAPSED_IAT_REPEATS):
+def estimate_collapsed_decay_rate(L_O, repeats=COLLAPSED_IAT_REPEATS):
     """Estimate the collapsed-model convergence rate via repeated MC samples."""
     samples = []
     for _ in range(max(1, repeats)):
@@ -441,7 +493,7 @@ def estimate_collapsed_iat_rate(L_O, repeats=COLLAPSED_IAT_REPEATS):
 
     samples_arr = np.asarray(samples, dtype=float)
     w_du, w_ud = _extract_F_from_L_O(L_O, N=3)
-    analytic = 0.5 * (w_du + w_ud)
+    analytic = w_du + w_ud
 
     if samples_arr.size:
         median_val = float(np.median(samples_arr))
@@ -524,7 +576,7 @@ def run_full_experiment():
     # --- Experiment Parameters ---
     J_list = np.linspace(0.2, 1.2, 8) # Our "barrier_heights"
     gamma_values = np.logspace(-1.5, 2.0, 20)
-    D_val = 0.5 # Fixed non-conservative strength
+    D_val = 1 # Fixed non-conservative strength
     N = 3
     
     # Simulation settings
@@ -540,15 +592,15 @@ def run_full_experiment():
             print(f"\nAnalyzing system for J = {J:.2f}...")
             
             # --- STAGE 1: COLLAPSED SYSTEM ---
-            # Compute both gap and IAT rate for L_O
+            # Compute both gap and decay rate for L_O
             L_O, s_L_O, w_du, w_ud = get_base_L_O_and_gap(N, J, D_val)
             print(f"  -> Spectral Gap s(L_O) = {s_L_O:.4e}")
-            collapsed_stats_theory = estimate_collapsed_iat_rate(L_O, repeats=collapsed_repeats)
+            collapsed_stats_theory = estimate_collapsed_decay_rate(L_O, repeats=collapsed_repeats)
             nu_collapsed_theory = collapsed_stats_theory["median"]
             theory_samples_arr = np.asarray(collapsed_stats_theory["samples"], dtype=float)
 
             # --- STAGE 2: LIFTED SYSTEM ---
-            iats_all = []
+            nu_samples_all = []
             med_rates = []  # Median rate for each gamma
 
             for Gamma in tqdm(gamma_values, desc=f"  Scanning gamma (J={J:.2f})", leave=False):
@@ -556,16 +608,16 @@ def run_full_experiment():
 
                 repeats_nu = []
                 for _ in range(REPEATS_PER_GAMMA):
-                    nu_eff = get_iat_rate_from_L(H, c_ops, J, D_val)
+                    nu_eff = get_iat_rate_from_L(H, c_ops, J, D_val, Gamma)
                     repeats_nu.append(nu_eff)
 
-                iats_all.append(repeats_nu)
+                nu_samples_all.append(repeats_nu)
                 med_rates.append(np.nanmedian(repeats_nu))
 
             med_rates = np.array(med_rates)
 
             gamma_high = float(gamma_values[-1])
-            high_gamma_samples = np.asarray(iats_all[-1], dtype=float) if iats_all else np.asarray([])
+            high_gamma_samples = np.asarray(nu_samples_all[-1], dtype=float) if nu_samples_all else np.asarray([])
             high_gamma_samples = high_gamma_samples[np.isfinite(high_gamma_samples) & (high_gamma_samples > 0)]
 
             if high_gamma_samples.size:
@@ -584,7 +636,7 @@ def run_full_experiment():
                 nu_collapsed_samples = valid_theory_samples.tolist()
                 collapsed_source = "theory"
                 collapse_mc_fallback = collapsed_stats_theory["used_fallback"]
-                print(f"  -> Collapsed IAT Rate nu(L_O) ≈ {nu_collapsed:.4e} (theoretical estimate)")
+                print(f"  -> Collapsed rate nu(L_O) ≈ {nu_collapsed:.4e} (theoretical estimate)")
 
             nu_collapsed_display = max(nu_collapsed, COLLAPSED_RATE_DISPLAY_FLOOR)
             s_L_O_display = s_L_O * S_LO_DISPLAY_SCALE
@@ -595,7 +647,7 @@ def run_full_experiment():
                 gamma_opt = float(gamma_values[max_rate_idx])
                 nu_max = float(med_rates[max_rate_idx])
 
-                print(f"  -> Optimal gamma = {gamma_opt:.3f}, Max IAT Rate = {nu_max:.4e}")
+                print(f"  -> Optimal gamma = {gamma_opt:.3f}, Max median rate = {nu_max:.4e}")
 
                 result_entry = {
                     "J": J,
@@ -614,7 +666,7 @@ def run_full_experiment():
                     "classical_rates": (w_du, w_ud),
                     "gammas": gamma_values,
                     "rates": med_rates,
-                    "rates_all": iats_all,
+                    "rates_all": nu_samples_all,
                     "gamma_opt": gamma_opt,
                     "nu_max": nu_max,
                     "rate_scale": RATE_RENORMALIZATION
@@ -637,7 +689,7 @@ def run_full_experiment():
                     "rate_scale": RATE_RENORMALIZATION
                 })
             else:
-                print(f"  -> IAT calculation failed for all gammas.")
+                print(f"  -> Rate estimation failed for all gammas.")
     except KeyboardInterrupt:
         print('\nRun interrupted by user; returning partial results.')
     finally:
@@ -730,7 +782,7 @@ def create_publication_figure(results):
                 if gamma_values.size:
                     gamma_high = float(gamma_values[-1])
             else:
-                collapsed_stats = estimate_collapsed_iat_rate(
+                collapsed_stats = estimate_collapsed_decay_rate(
                     L_O_obj,
                     repeats=res.get('collapsed_mc_repeats', COLLAPSED_IAT_REPEATS),
                 )
@@ -820,7 +872,7 @@ def create_publication_figure(results):
         ax_a.text2D(0.5, 0.5, "NESS computation failed.", transform=ax_a.transAxes, ha='center', va='center', fontsize=12)
     ax_a.set_title(r'\textbf{(a)} NESS Inner Spin Density Matrix', pad=14)
 
-    # --- Panel (b): Collapsed vs Lifted IAT Rates ---
+    # --- Panel (b): Collapsed vs Lifted Convergence Rates ---
     ax_b = fig.add_subplot(gs[0, 1])
     J_vals = np.array([enriched['J'] for enriched in enriched_results], dtype=float)
     nu_collapsed_vals = np.array([enriched.get('nu_collapsed', np.nan) for enriched in enriched_results], dtype=float)
@@ -867,7 +919,7 @@ def create_publication_figure(results):
         ax_b.set_xlim(lims)
         ax_b.set_ylim(lims)
         ax_b.set_xlabel(r'Collapsed rate $\nu(L_O)$')
-        ax_b.set_ylabel(r'Optimally lifted rate $\nu(L)$')
+        ax_b.set_ylabel(r'Optimally lifted rate $\nu_{\mathrm{opt}}(L)$')
         ax_b.set_title(r'\textbf{(b)} Collapsed vs Lifted Convergence Rates', pad=12)
         ax_b.grid(True, which='both', ls=':', alpha=0.4)
 
@@ -920,7 +972,7 @@ def create_publication_figure(results):
         ax_b.clear()
         ax_b.axis('off')
         ax_b.text(0.5, 0.5, 'Insufficient or non-positive data to construct plot (b)', ha='center', va='center', fontsize=12)
-    ax_b.set_title(r'\textbf{(b)} Collapsed vs Lifted (IAT Rates)', pad=12)
+    ax_b.set_title(r'\textbf{(b)} Collapsed vs Lifted Convergence Rates', pad=12)
 
 
     # --- Panel (c): Optimal Dissipation ---
@@ -966,10 +1018,10 @@ def create_publication_figure(results):
     ax_c.set_yscale('log') # Use log-log for (c) as well, often clearer
     ax_c.set_title(r'\textbf{(c)} Optimal Dissipation', pad=12)
     ax_c.set_xlabel(r'Friction Coefficient $\gamma$ (Dissipation $\Gamma$)')
-    ax_c.set_ylabel(r'Convergence Rate $\nu \propto 1/\tau_{\mathrm{IAT}}$')
+    ax_c.set_ylabel(r'Convergence Rate $\nu_{\mathrm{opt}}(\gamma)$')
     ax_c.legend()
 
-    # --- Panel (d): Quadratic Speedup (IAT vs Gap) ---
+    # --- Panel (d): Quadratic Speedup ---
     ax_d = fig.add_subplot(gs[1, 1])
     s_L_O_vals = np.array([enriched.get('s_L_O_display', enriched['s_L_O'] * S_LO_DISPLAY_SCALE) for enriched in enriched_results])
     nu_max_vals = np.array([enriched.get('nu_max', np.nan) for enriched in enriched_results])
@@ -1022,7 +1074,7 @@ def create_publication_figure(results):
     else:
         xlabel = r'Singular Gap $s(L_O)$'
     ax_d.set_xlabel(xlabel)
-    ax_d.set_ylabel(r'Max Lifted IAT Rate $\nu(L)$')
+    ax_d.set_ylabel(r'Max Lifted Rate $\nu_{\mathrm{opt}}$')
     ax_d.legend(loc='lower right')
 
     fig.subplots_adjust(left=0.08, right=0.98, bottom=0.08, top=0.94, wspace=0.28, hspace=0.35)

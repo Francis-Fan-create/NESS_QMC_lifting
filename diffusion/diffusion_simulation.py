@@ -1,3 +1,5 @@
+import json
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.sparse as sp
@@ -27,6 +29,9 @@ plt.rcParams.update({
 BETA = 1.0       # Inverse temperature (kb*T = 1)
 ALPHA = 0.5      # Strength of non-conservative force
 EPSILON = 0.1    # Tilt in the potential
+
+RESULTS_NPY_PATH = r'diffusion/experiment_results.npy'
+RESULTS_JSONL_PATH = r'diffusion/experiment_results.jsonl'
 
 @numba.njit
 def potential(x, y, h_b):
@@ -263,7 +268,7 @@ def run_overdamped_sim(n_steps, dt, h_b, q0):
         traj_x[i] = q[0]
     return traj_x
 
-# --- 4. Analysis: Integrated Autocorrelation Time ---
+# --- 4. Analysis: Correlation Diagnostics ---
 
 def integrated_autocorrelation_time(x, c=5):
     """
@@ -273,6 +278,116 @@ def integrated_autocorrelation_time(x, c=5):
     # Ensure the series is long enough
     if len(x) < 2 * c:
         return np.nan
+
+
+def save_results_jsonl(results, filepath):
+    """Persist experiment results alongside the binary checkpoint in JSON Lines."""
+
+    def to_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: to_serializable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [to_serializable(v) for v in obj]
+        if isinstance(obj, np.ndarray):
+            return to_serializable(obj.tolist())
+        if isinstance(obj, (np.floating, np.integer)):
+            return to_serializable(obj.item())
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+            return obj
+        if isinstance(obj, (int, str, bool)) or obj is None:
+            return obj
+        return to_serializable(str(obj))
+
+    try:
+        with open(filepath, 'w', encoding='utf-8') as handle:
+            for entry in results:
+                payload = to_serializable(entry)
+                handle.write(json.dumps(payload))
+                handle.write('\n')
+    except Exception:
+        print(f"  -> Warning: failed to write JSONL results to {filepath}.")
+
+
+def estimate_acf_decay_rate(x, dt, tail_fraction=0.35, min_tail_points=25, eps=1e-8):
+    """Estimate the exponential decay rate nu from the log-envelope of the ACF tail.
+
+    The method computes the normalized ACF of ``x`` using FFT-based convolution,
+    extracts the asymptotic tail, fits ``log(|ACF|)`` versus lag time, and returns
+    ``nu = -slope`` from that linear fit. Positive ``nu`` indicates exponential
+    decay of correlations. Returns NaN if a robust fit cannot be obtained.
+
+    Parameters
+    ----------
+    x : array_like
+        Time series samples.
+    dt : float
+        Sampling interval associated with the trajectory segments.
+    tail_fraction : float, optional
+        Fraction of the usable lags to keep for the tail fit (use the last
+        ``tail_fraction`` of the valid lags). Must lie in (0, 1].
+    min_tail_points : int, optional
+        Minimum number of tail points required to attempt the linear fit.
+    eps : float, optional
+        Threshold below which ``|ACF|`` values are ignored to avoid taking the
+        logarithm of noisy, near-zero correlations.
+    """
+
+    x = np.asarray(x, dtype=float)
+    if x.size < 3 or dt <= 0:
+        return np.nan
+
+    x_centered = x - np.mean(x)
+    n = x_centered.size
+    # Next power-of-two padding via 2*n FFT mirrors emcee-style ACF evaluation.
+    f = np.fft.fft(x_centered, n=2 * n)
+    acf = np.fft.ifft(f * np.conj(f))[:n].real
+    if acf[0] == 0:
+        return np.nan
+    acf /= acf[0]
+
+    lags = np.arange(n) * dt
+    acf_tail = acf[1:]
+    lag_tail = lags[1:]
+
+    valid = np.isfinite(acf_tail) & (np.abs(acf_tail) > eps)
+    if valid.sum() < max(min_tail_points, 5):
+        return np.nan
+
+    acf_valid = acf_tail[valid]
+    lag_valid = lag_tail[valid]
+
+    # Focus on the asymptotic region: keep only the last ``tail_fraction`` of the
+    # usable lags while ensuring at least ``min_tail_points`` samples.
+    tail_fraction = float(np.clip(tail_fraction, 1e-3, 1.0))
+    start_idx = max(int(np.floor((1.0 - tail_fraction) * acf_valid.size)), 0)
+    acf_tail = acf_valid[start_idx:]
+    lag_tail = lag_valid[start_idx:]
+
+    if acf_tail.size < min_tail_points:
+        # fall back to the longest available stretch with the required length
+        if acf_valid.size >= min_tail_points:
+            acf_tail = acf_valid[-min_tail_points:]
+            lag_tail = lag_valid[-min_tail_points:]
+        else:
+            return np.nan
+
+    if acf_tail.size < 2:
+        return np.nan
+
+    log_env = np.log(np.abs(acf_tail))
+    try:
+        slope, _ = np.polyfit(lag_tail, log_env, 1)
+    except np.linalg.LinAlgError:
+        return np.nan
+
+    nu = -float(slope)
+    if not np.isfinite(nu) or nu <= 0:
+        return np.nan
+    return nu
 
     # Calculate autocorrelation function using FFT
     n = len(x)
@@ -321,9 +436,9 @@ def run_full_experiment():
     barrier_heights = np.array([3.0, 3.5, 4.0, 4.5, 5.0])
     gamma_values = np.logspace(-1, 2, 20)
     
-    # Simulation settings for IAT calculation (can be overridden by QUICK mode below)
+    # Simulation settings for decay-rate estimation (can be overridden by QUICK mode below)
     SIM_DT = 0.01
-    N_STEPS_IAT = 2_000_000  # Long simulation for accurate IAT
+    N_STEPS_RATE = 2_000_000  # Long simulation for accurate rate estimate
     N_BURN_IN = 100_000      # Steps to discard for equilibration
     REPEATS_PER_GAMMA = 3    # Run multiple independent trajectories per gamma and aggregate
     initial_q = np.array([-1.0, 0.0])
@@ -333,7 +448,7 @@ def run_full_experiment():
     if prod:
         print('Production mode enabled: increasing simulation length and repeats for final results')
         # Conservative but substantially higher-quality settings. Adjust if you want longer runs.
-        N_STEPS_IAT = 100_000
+        N_STEPS_RATE = 100_000
         N_BURN_IN = 10_000
         REPEATS_PER_GAMMA = 30
         GRID_PTS = 50
@@ -347,7 +462,7 @@ def run_full_experiment():
     if quick:
         print('Quick mode enabled: using reduced settings for fast iteration')
         gamma_values = np.logspace(-1, 2, 12)
-        N_STEPS_IAT = 20000
+        N_STEPS_RATE = 20000
         N_BURN_IN = 2000
         REPEATS_PER_GAMMA = 24
         GRID_PTS = 30
@@ -364,11 +479,11 @@ def run_full_experiment():
 
             # --- STAGE 2: LIFTED SYSTEM ---
             # For robustness run several independent trajectories per gamma and aggregate (median, std)
-            iats_all = []
-            med_iats = []
-            std_iats = []
+            nu_samples_all = []
+            med_nus = []
+            std_nus = []
             # Keep total simulated time constant across different gamma by adapting dt and n_steps.
-            TOTAL_SIM_TIME = N_STEPS_IAT * SIM_DT
+            TOTAL_SIM_TIME = N_STEPS_RATE * SIM_DT
             BURN_TIME = N_BURN_IN * SIM_DT
 
             for gamma in tqdm(gamma_values, desc=f"  Scanning gamma (h_b={h_b})"):
@@ -381,63 +496,66 @@ def run_full_experiment():
                 n_steps_gamma = max(int(np.ceil(TOTAL_SIM_TIME / dt_gamma)), 10)
                 burn_steps_gamma = min(int(np.ceil(BURN_TIME / dt_gamma)), n_steps_gamma-1)
 
-                repeats = []
+                rate_repeats = []
                 for rep in range(REPEATS_PER_GAMMA):
                     traj = run_simulation(n_steps_gamma, dt_gamma, gamma, h_b, initial_q)
                     # apply burn-in in steps for this gamma
-                    iat = integrated_autocorrelation_time(traj[burn_steps_gamma:])
-                    repeats.append(iat)
-                repeats = np.array(repeats, dtype=float)
-                iats_all.append(repeats)
-                med_iats.append(np.nanmedian(repeats))
-                std_iats.append(np.nanstd(repeats))
+                    nu_est = estimate_acf_decay_rate(traj[burn_steps_gamma:], dt_gamma)
+                    rate_repeats.append(nu_est)
+                rate_repeats = np.array(rate_repeats, dtype=float)
+                nu_samples_all.append(rate_repeats)
+                med_nus.append(np.nanmedian(rate_repeats))
+                std_nus.append(np.nanstd(rate_repeats))
 
-            med_iats = np.array(med_iats)
-            std_iats = np.array(std_iats)
+            med_nus = np.array(med_nus, dtype=float)
+            std_nus = np.array(std_nus, dtype=float)
 
-            # Find optimal gamma using median IAT across repeats
-            valid_mask = ~np.isnan(med_iats)
+            # Find optimal gamma using the largest median decay rate across repeats
+            valid_mask = np.isfinite(med_nus)
             if np.any(valid_mask):
-                min_iat_idx = np.nanargmin(med_iats)
-                gamma_opt = float(gamma_values[min_iat_idx])
-                iat_min = float(med_iats[min_iat_idx])
-                # Convergence rate is proportional to 1/IAT (use median-based value)
-                nu_max = 1.0 / iat_min
+                max_nu_idx = np.nanargmax(med_nus)
+                gamma_opt = float(gamma_values[max_nu_idx])
+                nu_opt = float(med_nus[max_nu_idx])
+                nu_opt_std = float(std_nus[max_nu_idx]) if np.isfinite(std_nus[max_nu_idx]) else np.nan
 
-                print(f"  -> Optimal gamma = {gamma_opt:.3f}, Min median IAT = {iat_min:.3f}")
+                print(f"  -> Optimal gamma = {gamma_opt:.3f}, Max median rate = {nu_opt:.3e}")
 
                 results.append({
                     "h_b": h_b,
                     "s_L_O": s_L_O,
                     "gammas": gamma_values,
-                    "iats": med_iats,       # median per gamma
-                    "iats_all": iats_all,   # raw repeats per gamma
-                    "iats_std": std_iats,
+                    "nu_medians": med_nus,        # median rate per gamma
+                    "nu_samples": nu_samples_all,  # raw repeats per gamma
+                    "nu_std": std_nus,
                     "gamma_opt": gamma_opt,
-                    "iat_min": iat_min,
-                    "nu_max": nu_max
+                    "nu_opt": nu_opt,
+                    "nu_opt_std": nu_opt_std,
+                    "nu_source": "acf_tail"
                 })
                 # checkpoint: save after completing each barrier height so long runs can be resumed
                 try:
-                    np.save(r'diffusion/experiment_results.npy', results)
+                    np.save(RESULTS_NPY_PATH, results)
+                    save_results_jsonl(results, RESULTS_JSONL_PATH)
                     print(f"  -> Checkpoint saved ({len(results)} barrier(s) completed)")
                 except Exception:
                     print("  -> Warning: failed to save checkpoint file.")
             else:
-                print(f"  -> IAT calculation failed for all gammas.")
+                print(f"  -> Rate estimation failed for all gammas.")
     except KeyboardInterrupt:
         print('\nRun interrupted by user; saving partial results...')
         try:
-            np.save(r'diffusion/experiment_results.npy', results)
-            print('Partial results saved to experiment_results.npy')
+            np.save(RESULTS_NPY_PATH, results)
+            save_results_jsonl(results, RESULTS_JSONL_PATH)
+            print(f'Partial results saved to {RESULTS_NPY_PATH} and {RESULTS_JSONL_PATH}')
         except Exception:
             print('Failed to save partial results on interrupt.')
         raise
     except Exception as e:
         print(f"Exception during run_full_experiment: {e}")
         try:
-            np.save(r'diffusion/experiment_results.npy', results)
-            print('Partial results saved to experiment_results.npy')
+            np.save(RESULTS_NPY_PATH, results)
+            save_results_jsonl(results, RESULTS_JSONL_PATH)
+            print(f'Partial results saved to {RESULTS_NPY_PATH} and {RESULTS_JSONL_PATH}')
         except Exception:
             print('Failed to save partial results after exception.')
         raise
@@ -450,6 +568,46 @@ def create_publication_figure(results):
     print("\n--- Generating Publication Figure ---")
     fig = plt.figure(figsize=(12, 10))
     gs = fig.add_gridspec(2, 2, width_ratios=(1, 1), height_ratios=(1, 1))
+
+    def _extract_rate_series(res):
+        if 'nu_medians' in res:
+            return np.asarray(res['nu_medians'], dtype=float)
+        if 'iats' in res:
+            arr = np.asarray(res['iats'], dtype=float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                return np.where(arr > 0, 1.0 / arr, np.nan)
+        return np.array([], dtype=float)
+
+    def _extract_rate_std(res):
+        if 'nu_std' in res:
+            return np.asarray(res['nu_std'], dtype=float)
+        if 'iats_std' in res and 'iats' in res:
+            tau = np.asarray(res['iats'], dtype=float)
+            tau_std = np.asarray(res['iats_std'], dtype=float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                return np.where((tau > 0) & np.isfinite(tau_std), tau_std / (tau ** 2), np.nan)
+        return np.array([], dtype=float)
+
+    def _extract_rate_samples(res):
+        if 'nu_samples' in res:
+            return [np.asarray(s, dtype=float) for s in res['nu_samples']]
+        if 'iats_all' in res:
+            converted = []
+            for arr in res['iats_all']:
+                arr = np.asarray(arr, dtype=float)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    converted.append(np.where(arr > 0, 1.0 / arr, np.nan))
+            return converted
+        return []
+
+    def _extract_nu_opt(res):
+        if 'nu_opt' in res and np.isfinite(res['nu_opt']):
+            return float(res['nu_opt'])
+        if 'nu_max' in res and np.isfinite(res['nu_max']):
+            return float(res['nu_max'])
+        if 'iat_min' in res and res['iat_min'] and np.isfinite(res['iat_min']):
+            return 1.0 / float(res['iat_min']) if res['iat_min'] > 0 else np.nan
+        return np.nan
 
     # --- Panel (a): NESS and Potential ---
     ax_a = fig.add_subplot(gs[0, 0])
@@ -473,56 +631,58 @@ def create_publication_figure(results):
     ax_a.set_aspect('equal')
 
     # --- Panel (b): Direct comparison of convergence rates (Collapsed vs Lifted) ---
-    # We compute (or use cached) nu_collapsed = 1 / IAT_overdamped and compare to
-    # the optimal lifted rate nu_opt (already stored as 'nu_max' per result). Both are
-    # computed using the same IAT estimator for consistency.
+    # Compute (or reuse cached) collapse-only decay rates with the same ACF-tail
+    # estimator and compare them against the optimal lifted rates stored with each
+    # result.
     ax_b = fig.add_subplot(gs[0, 1])
 
     quick_flag = os.environ.get('ZENO_QUICK', '0') == '1'
     # Simulation defaults mirror the main experiment; quick mode uses smaller work.
     SIM_DT = 0.01
-    N_STEPS_IAT = 20000 if quick_flag else 2_000_000
+    N_STEPS_RATE = 20000 if quick_flag else 2_000_000
     N_BURN_IN = 2000 if quick_flag else 100_000
     REPEATS = 6 if quick_flag else 3
-    TOTAL_SIM_TIME = N_STEPS_IAT * SIM_DT
+    TOTAL_SIM_TIME = N_STEPS_RATE * SIM_DT
 
     # Compute nu_collapsed for each barrier if missing; cache into results to avoid recompute.
     for r in results:
-        if ('nu_collapsed' in r) and (r['nu_collapsed'] is not None) and (not np.isnan(r['nu_collapsed'])):
+        if ('nu_collapsed' in r) and (r['nu_collapsed'] is not None) and (not np.isnan(r['nu_collapsed'])) and ('nu_collapsed_rates' in r):
             continue
 
         h_b_val = r['h_b']
-        print(f"Computing overdamped IAT for collapsed system (h_b={h_b_val}) using {N_STEPS_IAT} steps x dt={SIM_DT}...")
+        print(f"Computing overdamped decay rate for collapsed system (h_b={h_b_val}) using {N_STEPS_RATE} steps x dt={SIM_DT}...")
         n_steps = max(int(np.ceil(TOTAL_SIM_TIME / SIM_DT)), 10)
         # N_BURN_IN is a number of steps (already in the script's convention).
         # Use burn_steps = min(N_BURN_IN, n_steps-1) to avoid converting by dt.
         burn_steps = min(int(N_BURN_IN), n_steps - 1)
 
-        iats_repeats = []
+        nu_repeats = []
         for rep in range(REPEATS):
             traj = run_overdamped_sim(n_steps, SIM_DT, h_b_val, np.array([-1.0, 0.0]))
-            iat = integrated_autocorrelation_time(traj[burn_steps:])
-            iats_repeats.append(iat)
+            nu_est = estimate_acf_decay_rate(traj[burn_steps:], SIM_DT)
+            nu_repeats.append(nu_est)
 
-        iats_repeats = np.array(iats_repeats)
-        med = float(np.nanmedian(iats_repeats)) if iats_repeats.size > 0 else np.nan
-        std = float(np.nanstd(iats_repeats)) if iats_repeats.size > 0 else np.nan
-        nu_collapsed = 1.0 / med if (med is not None and not np.isnan(med) and med > 0) else np.nan
+        nu_repeats = np.array(nu_repeats)
+        med = float(np.nanmedian(nu_repeats)) if nu_repeats.size > 0 else np.nan
+        std = float(np.nanstd(nu_repeats)) if nu_repeats.size > 0 else np.nan
+        nu_collapsed = med if (med is not None and np.isfinite(med) and med > 0) else np.nan
         r['nu_collapsed'] = nu_collapsed
-        r['nu_collapsed_iats'] = iats_repeats.tolist()
-        r['nu_collapsed_iat_median'] = med
-        r['nu_collapsed_iat_std'] = std
+        r['nu_collapsed_rates'] = nu_repeats.tolist()
+        r['nu_collapsed_median'] = med
+        r['nu_collapsed_std'] = std
+        r['nu_collapsed_source'] = 'acf_tail'
         # Save back to disk to cache heavy computation
         try:
-            np.save(r'diffusion/experiment_results.npy', results)
+            np.save(RESULTS_NPY_PATH, results)
+            save_results_jsonl(results, RESULTS_JSONL_PATH)
             print(f"  -> Cached nu_collapsed for h_b={h_b_val}")
         except Exception:
             print("  -> Warning: failed to cache updated results file for nu_collapsed.")
 
     # Gather arrays for plotting
     hb_vals = np.array([r['h_b'] for r in results])
-    nu_collapsed_vals = np.array([r.get('nu_collapsed', np.nan) for r in results])
-    nu_opt_vals = np.array([r.get('nu_max', np.nan) for r in results])
+    nu_collapsed_vals = np.array([r.get('nu_collapsed', np.nan) for r in results], dtype=float)
+    nu_opt_vals = np.array([_extract_nu_opt(r) for r in results], dtype=float)
 
     # Filter valid positive values
     valid = np.isfinite(nu_collapsed_vals) & np.isfinite(nu_opt_vals) & (nu_collapsed_vals > 0) & (nu_opt_vals > 0)
@@ -560,57 +720,57 @@ def create_publication_figure(results):
     # --- Panel (c): Optimal Dissipation ---
     ax_c = fig.add_subplot(gs[1, 0])
     res_plot = results[-1]
-    gammas = np.asarray(res_plot['gammas'])
-    # Use median IATs and std dev across repeats for error bars
-    med_iats = np.asarray(res_plot.get('iats'))
-    std_iats = np.asarray(res_plot.get('iats_std')) if res_plot.get('iats_std') is not None else np.zeros_like(med_iats)
+    gammas = np.asarray(res_plot['gammas'], dtype=float)
+    # Use median decay rates and their spread across repeats for error bars
+    med_rates = _extract_rate_series(res_plot)
+    std_rates = _extract_rate_std(res_plot)
+    if std_rates.size == 0:
+        std_rates = np.zeros_like(med_rates)
     # Optionally drop the smallest measured gamma if it looks like an outlier/noisy point
     # (this avoids an extrapolation/plot artifact and reveals the single peak supported by the rest of the data)
     if gammas.size >= 2:
         idx_min = int(np.nanargmin(gammas))
         # drop only from the plotting arrays, keep original results untouched
         gammas_plot_source = np.delete(gammas, idx_min)
-        med_iats_plot = np.delete(med_iats, idx_min)
-        std_iats_plot = np.delete(std_iats, idx_min)
+        med_rates_plot = np.delete(med_rates, idx_min)
+        std_rates_plot = np.delete(std_rates, idx_min)
     else:
         gammas_plot_source = gammas
-        med_iats_plot = med_iats
-        std_iats_plot = std_iats
-    # Guard against zeros or NaNs in med_iats to avoid infinite nu values
-    med_safe = med_iats_plot.copy()
-    med_safe = np.where(np.isnan(med_safe) | (med_safe <= 0), np.nan, med_safe)
-    nu_empirical = np.where(np.isfinite(med_safe), 1.0 / med_safe, np.nan)
-    nu_err = np.where(np.isfinite(med_safe), std_iats_plot / (med_safe**2), np.nan)
+        med_rates_plot = med_rates
+        std_rates_plot = std_rates
+    # Guard against zeros or NaNs to avoid invalid entries
+    rates_empirical = np.where(np.isfinite(med_rates_plot) & (med_rates_plot > 0), med_rates_plot, np.nan)
+    # std_rates_plot captured for potential future error bars; not used directly in current plot
 
     # --- Densify only inside the valid data-supported gamma range (no extrapolation) ---
     # Use the plotting-source arrays (may have dropped the smallest gamma)
-    valid = np.isfinite(nu_empirical) & (gammas_plot_source > 0) & (nu_empirical > 0)
-    nu_plot = None
+    valid = np.isfinite(rates_empirical) & (gammas_plot_source > 0) & (rates_empirical > 0)
+    rate_plot = None
     gammas_plot = None
     if valid.sum() >= 2:
-        gamma_min_valid = float(gammas_plot_source[valid].min())
-        gamma_max_valid = float(gammas_plot_source[valid].max())
+        gamma_min_valid = float(np.nanmin(gammas_plot_source[valid]))
+        gamma_max_valid = float(np.nanmax(gammas_plot_source[valid]))
         # densify inside the measured range only (no extrapolation beyond data)
         gammas_plot = np.logspace(np.log10(gamma_min_valid), np.log10(gamma_max_valid), num=400)
         log_xs = np.log10(gammas_plot_source[valid])
-        log_ys = np.log10(nu_empirical[valid])
+        log_ys = np.log10(rates_empirical[valid])
         log_xt = np.log10(gammas_plot)
         # interpolate in log-log space; since gammas_plot is within [gamma_min_valid, gamma_max_valid] no extrapolation
         log_yt = np.interp(log_xt, log_xs, log_ys)
-        nu_plot = 10 ** (log_yt)
+        rate_plot = 10 ** (log_yt)
     else:
         # fall back to plotting raw data only (use plotting-source arrays)
         gammas_plot = gammas_plot_source
-        nu_plot = nu_empirical
+        rate_plot = rates_empirical
 
     # Plot raw points faded, and an interpolated dense curve in the small-gamma region (no smoothing)
-    ax_c.plot(gammas_plot_source, nu_empirical, 'o', color='darkorange', alpha=0.6, ms=6, label=r'Raw $\nu$')
-    ax_c.plot(gammas_plot, nu_plot, '-', color='darkorange', lw=1.5, alpha=0.95, label=r'Dense interpolation (no extrapolation)')
+    ax_c.plot(gammas_plot_source, rates_empirical, 'o', color='darkorange', alpha=0.6, ms=6, label=r'Raw $\nu$')
+    ax_c.plot(gammas_plot, rate_plot, '-', color='darkorange', lw=1.5, alpha=0.95, label=r'Dense interpolation (no extrapolation)')
     # Mark the maximum of the interpolated curve explicitly
-    if np.any(np.isfinite(nu_plot)):
-        max_idx = int(np.nanargmax(nu_plot))
+    if np.any(np.isfinite(rate_plot)):
+        max_idx = int(np.nanargmax(rate_plot))
         gamma_peak = gammas_plot[max_idx]
-        nu_peak = float(nu_plot[max_idx])
+        nu_peak = float(rate_plot[max_idx])
         ax_c.plot([gamma_peak], [nu_peak], marker='*', color='black', ms=12, label=r'Peak')
         ax_c.axvline(gamma_peak, color='k', linestyle='--', alpha=0.6)
         label = r'$\gamma_{\mathrm{opt}} = ' + f'{gamma_peak:.2g}' + r'$'
@@ -621,14 +781,14 @@ def create_publication_figure(results):
     ax_c.set_xscale('log')
     ax_c.set_title(r'\textbf{(c)} Optimal Dissipation', y=1.05)
     ax_c.set_xlabel(r'Friction Coefficient $\gamma$')
-    ax_c.set_ylabel(r'Convergence Rate $\nu \propto 1/\tau_x$')
+    ax_c.set_ylabel(r'Convergence Rate $\nu$')
     ax_c.legend()
 
     # --- Panel (d): Quadratic Speedup ---
     ax_d = fig.add_subplot(gs[1, 1])
     s_L_O_vals = np.array([r['s_L_O'] for r in results])
-    # use median-based nu_max (1/iat_min) across results
-    # compute bootstrapped nu_max distributions if repeats are available
+    # use median-based optimal rates across results
+    # compute bootstrapped nu_opt distributions if repeats are available
     quick_flag = os.environ.get('ZENO_QUICK', '0') == '1'
     B = 100 if quick_flag else 200
     nu_max_vals = []
@@ -636,39 +796,39 @@ def create_publication_figure(results):
     nu_ci_low = []
     nu_ci_high = []
     for r in results:
-        if 'iats_all' in r and r['iats_all']:
-            # iats_all: list of arrays of repeats per gamma
-            # bootstrap the iat_min (median across gammas) per bootstrap sample
-            iats_all = np.asarray(r['iats_all'])
-            # compute per-gamma medians per bootstrap
+        rate_samples = _extract_rate_samples(r)
+        if rate_samples:
             bs_nu = []
-            for b in range(B):
-                # resample repeats with replacement for each gamma
+            for _ in range(B):
                 medians = []
-                for g_idx in range(iats_all.shape[0]):
-                    repeats = iats_all[g_idx]
-                    if len(repeats) == 0:
+                for arr in rate_samples:
+                    arr = np.asarray(arr, dtype=float)
+                    arr = arr[np.isfinite(arr) & (arr > 0)]
+                    if arr.size == 0:
                         medians.append(np.nan)
-                    else:
-                        sample = np.random.choice(repeats, size=len(repeats), replace=True)
-                        medians.append(np.nanmedian(sample))
-                medians = np.array(medians)
-                # find min median across gammas
+                        continue
+                    sample = np.random.choice(arr, size=arr.size, replace=True)
+                    medians.append(np.nanmedian(sample))
+                medians = np.array(medians, dtype=float)
                 if np.all(np.isnan(medians)):
                     bs_nu.append(np.nan)
                 else:
-                    iat_min_b = np.nanmin(medians)
-                    bs_nu.append(1.0 / iat_min_b)
-            bs_nu = np.array(bs_nu)
-            # summarize
-            nu_max_vals.append(np.nanmedian(bs_nu))
-            # variance in log space for weighting
-            log_bs = np.log(bs_nu[~np.isnan(bs_nu)])
-            nu_log_vars.append(np.var(log_bs) if log_bs.size>0 else np.nan)
-            nu_ci_low.append(np.nanpercentile(bs_nu, 2.5))
-            nu_ci_high.append(np.nanpercentile(bs_nu, 97.5))
+                    bs_nu.append(np.nanmax(medians))
+            bs_nu = np.array(bs_nu, dtype=float)
+            if np.all(np.isnan(bs_nu)):
+                nu_max_vals.append(np.nan)
+                nu_log_vars.append(np.nan)
+                nu_ci_low.append(np.nan)
+                nu_ci_high.append(np.nan)
+            else:
+                nu_max_vals.append(np.nanmedian(bs_nu))
+                log_bs = np.log(bs_nu[np.isfinite(bs_nu) & (bs_nu > 0)])
+                nu_log_vars.append(np.var(log_bs) if log_bs.size > 0 else np.nan)
+                nu_ci_low.append(np.nanpercentile(bs_nu, 2.5))
+                nu_ci_high.append(np.nanpercentile(bs_nu, 97.5))
         else:
-            nu_max_vals.append(r.get('nu_max', np.nan))
+            nu_val = _extract_nu_opt(r)
+            nu_max_vals.append(nu_val)
             nu_log_vars.append(np.nan)
             nu_ci_low.append(np.nan)
             nu_ci_high.append(np.nan)
@@ -750,15 +910,16 @@ def create_publication_figure(results):
 
 if __name__ == '__main__':
     # It's recommended to cache results as the simulation is long.
-    results_file = r'diffusion/experiment_results.npy'
-    
+    results_file = RESULTS_NPY_PATH
+
     if os.path.exists(results_file):
         print(f"Loading cached results from {results_file}...")
         results = np.load(results_file, allow_pickle=True).tolist()
     else:
         results = run_full_experiment()
         np.save(results_file, results)
-        print(f"\nResults saved to {results_file} for future use.")
+        save_results_jsonl(results, RESULTS_JSONL_PATH)
+        print(f"\nResults saved to {results_file} and {RESULTS_JSONL_PATH} for future use.")
 
     if results:
         create_publication_figure(results)
