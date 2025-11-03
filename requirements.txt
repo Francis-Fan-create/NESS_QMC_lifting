@@ -1,0 +1,7 @@
+numpy
+numba
+scipy
+tqdm
+matplotlib
+pathlib
+qutip
