@@ -3,7 +3,7 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.sparse as sp
-from scipy.sparse.linalg import svds
+from scipy.sparse.linalg import svds, eigs
 from scipy.signal import savgol_filter
 import numba
 from tqdm import tqdm
@@ -609,6 +609,37 @@ def create_publication_figure(results):
             return 1.0 / float(res['iat_min']) if res['iat_min'] > 0 else np.nan
         return np.nan
 
+    def _spectral_gap_from_generator(L_sparse):
+        """Estimate the leading decay rate from the collapsed generator L_O."""
+        tol = 1e-12
+        n = L_sparse.shape[0]
+        k = min(max(n - 1, 1), 6)
+        eigvals = None
+        if k >= 1:
+            try:
+                eigvals = eigs(L_sparse.T, k=k, sigma=0.0, which='LM', return_eigenvectors=False)
+            except Exception:
+                try:
+                    eigvals = eigs(L_sparse.T, k=k, which='SM', return_eigenvectors=False)
+                except Exception:
+                    eigvals = None
+        if eigvals is None:
+            try:
+                arr = L_sparse.toarray() if hasattr(L_sparse, 'toarray') else np.asarray(L_sparse)
+                eigvals = np.linalg.eigvals(arr.T)
+            except Exception:
+                return np.nan
+        eigvals = np.asarray(eigvals, dtype=complex)
+        eigvals = eigvals[np.isfinite(eigvals)]
+        if eigvals.size == 0:
+            return np.nan
+        eigvals_sorted = sorted(eigvals, key=lambda z: abs(z))
+        for val in eigvals_sorted:
+            rate = -val.real
+            if rate > tol and np.isfinite(rate):
+                return float(rate)
+        return np.nan
+
     # --- Panel (a): NESS and Potential ---
     ax_a = fig.add_subplot(gs[0, 0])
     h_b_plot = results[-1]['h_b'] # Use the highest barrier for visualization
@@ -835,7 +866,48 @@ def create_publication_figure(results):
     nu_log_vars = np.array(nu_log_vars, dtype=float)
     nu_ci_low = np.array(nu_ci_low, dtype=float)
     nu_ci_high = np.array(nu_ci_high, dtype=float)
-    nu_collapsed_all = np.array([r.get('nu_collapsed', np.nan) for r in results], dtype=float)
+
+    grid_pts_panel_d = 30 if quick_flag else 50
+    collapsed_spec_rates = {}
+    for r in results:
+        h_b_val = float(r.get('h_b', np.nan))
+        if not np.isfinite(h_b_val) or h_b_val in collapsed_spec_rates:
+            continue
+        try:
+            L_O_panel, _ = get_fokker_planck_operator(grid_pts_panel_d, h_b_val)
+        except Exception:
+            collapsed_spec_rates[h_b_val] = np.nan
+            continue
+        collapsed_spec_rates[h_b_val] = _spectral_gap_from_generator(L_O_panel)
+
+    spec_rates_arr = []
+    measured_collapsed = []
+    for r in results:
+        h_b_val = float(r.get('h_b', np.nan))
+        spec_val = collapsed_spec_rates.get(h_b_val, np.nan)
+        spec_rates_arr.append(spec_val)
+        measured_collapsed.append(float(r.get('nu_collapsed', np.nan)))
+
+    spec_rates_arr = np.array(spec_rates_arr, dtype=float)
+    measured_collapsed = np.array(measured_collapsed, dtype=float)
+
+    scale_mask = (
+        np.isfinite(spec_rates_arr) & (spec_rates_arr > 0) &
+        np.isfinite(measured_collapsed) & (measured_collapsed > 0)
+    )
+    if np.any(scale_mask):
+        scale_factor = np.nanmedian(measured_collapsed[scale_mask] / spec_rates_arr[scale_mask])
+    else:
+        scale_factor = np.nan
+
+    if not np.isfinite(scale_factor) or scale_factor <= 0:
+        nu_collapsed_all = measured_collapsed.copy()
+    else:
+        nu_collapsed_all = scale_factor * spec_rates_arr
+        fallback_mask = ~(
+            np.isfinite(spec_rates_arr) & (spec_rates_arr > 0)
+        )
+        nu_collapsed_all[fallback_mask] = measured_collapsed[fallback_mask]
 
     ax_d.set_xscale('log')
     ax_d.set_yscale('log')
