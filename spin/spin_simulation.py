@@ -1023,50 +1023,105 @@ def create_publication_figure(results):
 
     # --- Panel (d): Quadratic Speedup ---
     ax_d = fig.add_subplot(gs[1, 1])
-    s_L_O_vals = np.array([enriched.get('s_L_O_display', enriched['s_L_O'] * S_LO_DISPLAY_SCALE) for enriched in enriched_results])
-    nu_max_vals = np.array([enriched.get('nu_max', np.nan) for enriched in enriched_results])
-    
-    valid_data = np.isfinite(s_L_O_vals) & np.isfinite(nu_max_vals) & (s_L_O_vals > 0) & (nu_max_vals > 0)
-    
-    if valid_data.sum() >= 2:
-        x_pts = s_L_O_vals[valid_data]
-        y_pts = nu_max_vals[valid_data]
-        # Check for meaningful spread in x and y before attempting a log-log fit
-        x_spread_ok = (np.isfinite(x_pts).all() and x_pts.max() / (x_pts.min() + 1e-30) > 1.02)
-        y_spread_ok = (np.isfinite(y_pts).all() and y_pts.max() / (y_pts.min() + 1e-30) > 1.02)
+    s_L_O_all = np.array(
+        [enriched.get('s_L_O_display', enriched['s_L_O'] * S_LO_DISPLAY_SCALE) for enriched in enriched_results],
+        dtype=float,
+    )
+    nu_opt_all = np.array([enriched.get('nu_max', np.nan) for enriched in enriched_results], dtype=float)
+    nu_collapsed_all = np.array([enriched.get('nu_collapsed', np.nan) for enriched in enriched_results], dtype=float)
 
-        if x_spread_ok and y_spread_ok and (x_pts.min() > 0) and (y_pts.min() > 0):
-            ax_d.set_xscale('log')
-            ax_d.set_yscale('log')
-            ax_d.plot(x_pts, y_pts, 'o', color='purple', markersize=7, label='Numerical Results')
+    ax_d.set_xscale('log')
+    ax_d.set_yscale('log')
 
-            # Fit and plot scaling law
-            log_s = np.log10(x_pts)
-            log_nu = np.log10(y_pts)
-            coeffs = np.polyfit(log_s, log_nu, 1)
-            fit_slope = coeffs[0]
-            fit_intercept = coeffs[1]
+    def _plot_with_fit(x_vals, y_vals, marker, color, label_points, fit_label, linestyle='--'):
+        mask = np.isfinite(x_vals) & np.isfinite(y_vals) & (x_vals > 0) & (y_vals > 0)
+        if not np.any(mask):
+            return None
 
-            x_fit = np.logspace(np.log10(x_pts.min()), np.log10(x_pts.max()), 100)
-            y_fit = (10**fit_intercept) * (x_fit ** fit_slope)
-            ax_d.plot(x_fit, y_fit, 'k--', lw=1.2, label=f'Fit: slope={fit_slope:.2f}')
+        x_sel = x_vals[mask]
+        y_sel = y_vals[mask]
+        ax_d.plot(x_sel, y_sel, marker, color=color, markersize=7, label=label_points)
 
-            # Theoretical reference (slope 1/2)
-            y_ref = (x_fit ** 0.5) * (y_pts[0] / (x_pts[0] ** 0.5)) # Rescaled
-            ax_d.plot(x_fit, y_ref, color='0.2', linestyle=':', lw=1.5, label=r'Theory: slope $1/2$')
+        slope = None
+        if x_sel.size > 1:
+            log_x = np.log(x_sel)
+            log_y = np.log(y_sel)
+            fit_mask = np.ones_like(log_x, dtype=bool)
+            for _ in range(3):
+                if fit_mask.sum() < 2:
+                    break
+                coeffs = np.polyfit(log_x[fit_mask], log_y[fit_mask], 1)
+                pred = coeffs[0] * log_x + coeffs[1]
+                resid = log_y - pred
+                sigma = np.nanstd(resid[fit_mask])
+                sigma = max(sigma, 1e-12)
+                fit_mask = np.abs(resid) < 2.0 * sigma
+            if fit_mask.sum() >= 2:
+                coeffs = np.polyfit(log_x[fit_mask], log_y[fit_mask], 1)
+                slope = coeffs[0]
+                intercept = coeffs[1]
+                x_fit = np.logspace(np.log10(x_sel.min()), np.log10(x_sel.max()), 200)
+                y_fit = np.exp(intercept) * (x_fit ** slope)
+                ax_d.plot(x_fit, y_fit, linestyle, color=color, lw=1.2, label=fit_label.format(slope=slope))
 
-            ax_d.set_title(r'\textbf{{(d)}} Quadratic Speedup ($m \approx {:.2f}$)'.format(fit_slope), pad=12)
-        else:
-            # Not enough spread to perform a meaningful fit. Show raw points (with small jitter) and a note.
-            ax_d.plot(np.arange(len(y_pts)), y_pts, 'o', color='purple', markersize=7, label='Numerical Results (no fit)')
-            ax_d.set_xscale('linear')
-            ax_d.set_yscale('log' if (y_pts.min() > 0 and y_pts.max()/y_pts.min() > 1.2) else 'linear')
-            ax_d.set_title(r'\textbf{(d)} Quadratic Speedup (insufficient spread for fit)', pad=12)
-            ax_d.text(0.5, 0.9, 'Insufficient variation in singular gap or rates to fit a scaling law.', transform=ax_d.transAxes, ha='center', va='top', fontsize=9)
-            ax_d.set_xlabel('Index (insufficient spread in s(L_O))')
+        return {
+            'slope': slope,
+            'x': x_sel,
+            'y': y_sel,
+        }
+
+    opt_info = _plot_with_fit(s_L_O_all, nu_opt_all, 'o', 'purple', r'Lifted $\nu(L)$', 'Fit ($L$, slope={slope:.2f})')
+    collapsed_info = _plot_with_fit(
+        s_L_O_all,
+        nu_collapsed_all,
+        's',
+        'tab:green',
+        r'Collapsed $\nu(L_O)$',
+        'Fit ($L_O$, slope={slope:.2f})',
+        linestyle='-'
+    )
+
+    x_arrays = []
+    if opt_info:
+        x_arrays.append(opt_info['x'])
+    if collapsed_info:
+        x_arrays.append(collapsed_info['x'])
+    x_all = np.concatenate(x_arrays) if x_arrays else np.array([])
+
+    if opt_info and opt_info['x'].size > 0:
+        base_const = opt_info['y'][0] / (opt_info['x'][0] ** 0.5)
+    elif collapsed_info and collapsed_info['x'].size > 0:
+        base_const = collapsed_info['y'][0] / (collapsed_info['x'][0] ** 0.5)
     else:
-        ax_d.text(0.5, 0.5, 'Insufficient data for plot (d)', ha='center', va='center')
-    ax_d.set_title(r'\textbf{(d)} Quadratic Speedup', pad=12)
+        base_const = None
+
+    if x_all.size >= 2:
+        x_ref = np.logspace(np.log10(x_all.min()), np.log10(x_all.max()), 100)
+    else:
+        x_ref = np.array([])
+
+    if x_ref.size > 0 and base_const is not None and np.isfinite(base_const):
+        y_ref = base_const * (x_ref ** 0.5)
+        ax_d.plot(x_ref, y_ref, color='0.2', linestyle=':', lw=1.5, label=r'Theory: slope $1/2$')
+
+    slope_opt = opt_info['slope'] if opt_info else None
+    slope_collapsed = collapsed_info['slope'] if collapsed_info else None
+
+    title_terms = []
+    if slope_opt is not None and np.isfinite(slope_opt):
+        title_terms.append('$' + r'm_{L}\approx' + f'{slope_opt:.2f}' + '$')
+    if slope_collapsed is not None and np.isfinite(slope_collapsed):
+        title_terms.append('$' + r'm_{L_O}\approx' + f'{slope_collapsed:.2f}' + '$')
+
+    if title_terms:
+        title_text = r'\textbf{(d)} Quadratic Speedup (' + ', '.join(title_terms) + ')'
+    else:
+        title_text = r'\textbf{(d)} Quadratic Speedup'
+
+    if not opt_info and not collapsed_info:
+        ax_d.text(0.5, 0.5, 'Insufficient positive data for plot (d)', ha='center', va='center')
+
+    ax_d.set_title(title_text, pad=12)
 
     if S_LO_DISPLAY_SCALE != 1.0:
         xlabel = rf'Singular Gap $s(L_O)$ (display × {S_LO_DISPLAY_SCALE:.2g})'
@@ -1074,7 +1129,7 @@ def create_publication_figure(results):
     else:
         xlabel = r'Singular Gap $s(L_O)$'
     ax_d.set_xlabel(xlabel)
-    ax_d.set_ylabel(r'Max Lifted Rate $\nu_{\mathrm{opt}}$')
+    ax_d.set_ylabel(r'Rate $\nu$')
     ax_d.legend(loc='lower right')
 
     fig.subplots_adjust(left=0.08, right=0.98, bottom=0.08, top=0.94, wspace=0.28, hspace=0.35)

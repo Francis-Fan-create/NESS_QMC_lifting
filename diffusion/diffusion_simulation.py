@@ -786,9 +786,7 @@ def create_publication_figure(results):
 
     # --- Panel (d): Quadratic Speedup ---
     ax_d = fig.add_subplot(gs[1, 1])
-    s_L_O_vals = np.array([r['s_L_O'] for r in results])
-    # use median-based optimal rates across results
-    # compute bootstrapped nu_opt distributions if repeats are available
+    s_L_O_all = np.array([r['s_L_O'] for r in results], dtype=float)
     quick_flag = os.environ.get('ZENO_QUICK', '0') == '1'
     B = 100 if quick_flag else 200
     nu_max_vals = []
@@ -832,72 +830,107 @@ def create_publication_figure(results):
             nu_log_vars.append(np.nan)
             nu_ci_low.append(np.nan)
             nu_ci_high.append(np.nan)
-    nu_max_vals = np.array(nu_max_vals)
-    nu_log_vars = np.array(nu_log_vars)
-    nu_ci_low = np.array(nu_ci_low)
-    nu_ci_high = np.array(nu_ci_high)
-    
-    valid_data = ~np.isnan(s_L_O_vals) & ~np.isnan(nu_max_vals)
-    s_L_O_vals = s_L_O_vals[valid_data]
-    nu_max_vals = nu_max_vals[valid_data]
 
-    # plot errorbars for nu (CI) when available on log-log axes for clarity
+    nu_max_vals = np.array(nu_max_vals, dtype=float)
+    nu_log_vars = np.array(nu_log_vars, dtype=float)
+    nu_ci_low = np.array(nu_ci_low, dtype=float)
+    nu_ci_high = np.array(nu_ci_high, dtype=float)
+    nu_collapsed_all = np.array([r.get('nu_collapsed', np.nan) for r in results], dtype=float)
+
     ax_d.set_xscale('log')
     ax_d.set_yscale('log')
-    # protect against zero/negative values
-    positive = (s_L_O_vals > 0) & (nu_max_vals > 0)
-    if np.any(positive):
-        x_pts = s_L_O_vals[positive]
-        y_pts = nu_max_vals[positive]
-        # y-errorbars from CI
-        yerr_low = y_pts - nu_ci_low[positive]
-        yerr_high = nu_ci_high[positive] - y_pts
-        # Do not plot error bars (bootstrap CI are noisy for small sample sizes). Plot only points.
-        ax_d.plot(x_pts, y_pts, 'o', color='purple', markersize=7, label='Numerical Results')
 
-        # Fit and plot scaling law (robust log-log fit with simple sigma-clipping)
-        if x_pts.size > 1:
-            log_s = np.log(x_pts)
-            log_nu = np.log(y_pts)
+    def _plot_with_fit(x_vals, y_vals, marker, color, label_points, fit_label, linestyle='--'):
+        mask = np.isfinite(x_vals) & np.isfinite(y_vals) & (x_vals > 0) & (y_vals > 0)
+        if not np.any(mask):
+            return None
+        x_sel = x_vals[mask]
+        y_sel = y_vals[mask]
+        ax_d.plot(x_sel, y_sel, marker, color=color, markersize=7, label=label_points)
 
-            mask = np.ones_like(log_s, dtype=bool)
+        slope = None
+        if x_sel.size > 1:
+            log_x = np.log(x_sel)
+            log_y = np.log(y_sel)
+            fit_mask = np.ones_like(log_x, dtype=bool)
             for _ in range(3):
-                if mask.sum() < 2:
+                if fit_mask.sum() < 2:
                     break
-                coeffs = np.polyfit(log_s[mask], log_nu[mask], 1)
-                pred = coeffs[0] * log_s + coeffs[1]
-                resid = log_nu - pred
-                sigma = np.nanstd(resid[mask])
+                coeffs = np.polyfit(log_x[fit_mask], log_y[fit_mask], 1)
+                pred = coeffs[0] * log_x + coeffs[1]
+                resid = log_y - pred
+                sigma = np.nanstd(resid[fit_mask])
                 sigma = max(sigma, 1e-12)
-                mask = np.abs(resid) < 2.0 * sigma
+                fit_mask = np.abs(resid) < 2.0 * sigma
+            if fit_mask.sum() >= 2:
+                coeffs = np.polyfit(log_x[fit_mask], log_y[fit_mask], 1)
+                slope = coeffs[0]
+                intercept = coeffs[1]
+                x_fit = np.logspace(np.log10(x_sel.min()), np.log10(x_sel.max()), 200)
+                y_fit = np.exp(intercept) * (x_fit ** slope)
+                ax_d.plot(x_fit, y_fit, linestyle, color=color, lw=1.2, label=fit_label.format(slope=slope))
 
-            if mask.sum() >= 2:
-                # final (unweighted) fit on clipped data
-                coeffs = np.polyfit(log_s[mask], log_nu[mask], 1)
-                fit_slope = coeffs[0]
-                fit_intercept = coeffs[1]
-                # prepare fit curve
-                x_fit = np.logspace(np.log10(x_pts.min()), np.log10(x_pts.max()), 200)
-                y_fit = np.exp(fit_intercept) * (x_fit ** fit_slope)
-                ax_d.plot(x_fit, y_fit, 'k--', lw=1.2, label=f'Fit: slope={fit_slope:.2f}')
-            else:
-                fit_slope = np.nan
+        return {
+            'slope': slope,
+            'x': x_sel,
+            'y': y_sel
+        }
 
-        # Theoretical reference (slope 1/2)
-        x_ref = np.logspace(np.log10(x_pts.min()), np.log10(x_pts.max()), 100)
-        y_ref = (x_ref ** 0.5) * (y_pts[0] / (x_pts[0] ** 0.5))
+    opt_info = _plot_with_fit(s_L_O_all, nu_max_vals, 'o', 'purple', r'Lifted $\nu(L)$', 'Fit ($L$, slope={slope:.2f})')
+    lo_info = _plot_with_fit(s_L_O_all, nu_collapsed_all, 's', 'tab:green', r'Collapsed $\nu(L_O)$', 'Fit ($L_O$, slope={slope:.2f})', linestyle='-')
+
+    x_arrays = []
+    if opt_info:
+        x_arrays.append(opt_info['x'])
+    if lo_info:
+        x_arrays.append(lo_info['x'])
+    if x_arrays:
+        x_all = np.concatenate(x_arrays)
+    else:
+        x_all = np.array([])
+
+    if x_all.size >= 2:
+        x_ref = np.logspace(np.log10(x_all.min()), np.log10(x_all.max()), 100)
+    else:
+        x_ref = np.array([])
+
+    base_const = None
+    if opt_info and opt_info['x'].size > 0:
+        base_const = opt_info['y'][0] / (opt_info['x'][0] ** 0.5)
+    elif lo_info and lo_info['x'].size > 0:
+        base_const = lo_info['y'][0] / (lo_info['x'][0] ** 0.5)
+
+    if x_ref.size > 0 and base_const is not None and np.isfinite(base_const):
+        y_ref = base_const * (x_ref ** 0.5)
         ax_d.plot(x_ref, y_ref, color='0.2', linestyle=':', lw=1.5, label=r'Theory: slope $1/2$')
 
-        if not np.isnan(fit_slope):
-            ax_d.set_title(r'\textbf{{(d)}} Quadratic Speedup ($m \approx {:.2f}$)'.format(fit_slope), y=1.05)
-        else:
-            ax_d.set_title(r'\textbf{(d)} Quadratic Speedup', y=1.05)
+    if opt_info:
+        slope_opt = opt_info['slope']
     else:
-        ax_d.text(0.5, 0.5, 'Insufficient positive data for panel (d)', ha='center', va='center')
-        ax_d.set_title(r'\textbf{(d)} Quadratic Speedup', y=1.05)
+        slope_opt = None
+    if lo_info:
+        slope_lo = lo_info['slope']
+    else:
+        slope_lo = None
 
+    title_terms = []
+    if slope_opt is not None and np.isfinite(slope_opt):
+        # put \mathrm inside math mode so LaTeX accepts it
+        title_terms.append('$' + r'm_{L}\approx' + f'{slope_opt:.2f}' + '$')
+    if slope_lo is not None and np.isfinite(slope_lo):
+        title_terms.append('$' + r'm_{L_O}\approx' + f'{slope_lo:.2f}' + '$')
+
+    if title_terms:
+        title_text = r'\textbf{(d)} Quadratic Speedup (' + ', '.join(title_terms) + ')'
+    else:
+        title_text = r'\textbf{(d)} Quadratic Speedup'
+
+    if not opt_info and not lo_info:
+        ax_d.text(0.5, 0.5, 'Insufficient positive data for panel (d)', ha='center', va='center')
+
+    ax_d.set_title(title_text, y=1.05)
     ax_d.set_xlabel(r'Singular Gap $s(L_O)$')
-    ax_d.set_ylabel(r'Max Lifted Rate $\nu_{opt}$')
+    ax_d.set_ylabel(r'Rate $\nu$')
     ax_d.legend(loc='lower right')
 
     plt.tight_layout(pad=2.0)
