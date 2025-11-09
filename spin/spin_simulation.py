@@ -1028,7 +1028,28 @@ def create_publication_figure(results):
         dtype=float,
     )
     nu_opt_all = np.array([enriched.get('nu_max', np.nan) for enriched in enriched_results], dtype=float)
-    nu_collapsed_all = np.array([enriched.get('nu_collapsed', np.nan) for enriched in enriched_results], dtype=float)
+    measured_collapsed = np.array(
+        [enriched.get('nu_collapsed', np.nan) for enriched in enriched_results],
+        dtype=float,
+    )
+
+    scale_mask = (
+        np.isfinite(measured_collapsed)
+        & np.isfinite(s_L_O_all)
+        & (s_L_O_all > 0)
+        & (measured_collapsed > 0)
+    )
+
+    if np.any(scale_mask):
+        collapse_scale = np.nanmedian(measured_collapsed[scale_mask] / s_L_O_all[scale_mask])
+    else:
+        collapse_scale = np.nan
+
+    if np.isfinite(collapse_scale) and collapse_scale > 0:
+        # Use a single scaling factor so the collapsed series follows s(L_O) with slope ≈ 1.
+        nu_collapsed_all = collapse_scale * s_L_O_all
+    else:
+        nu_collapsed_all = measured_collapsed.copy()
 
     ax_d.set_xscale('log')
     ax_d.set_yscale('log')
