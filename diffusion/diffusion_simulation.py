@@ -839,6 +839,12 @@ def create_publication_figure(results):
 
     measured_collapsed = np.array([r.get('nu_collapsed', np.nan) for r in results], dtype=float)
 
+    # Theory predicts nu_collapsed ~ s(L_O). Since the measured nu_collapsed may have
+    # a different proportionality constant than s(L_O), we scale nu_collapsed to align
+    # with s(L_O) using the median ratio. This preserves the SHAPE of the relationship
+    # (which determines the slope m_{L_O}) while putting both on the same scale for 
+    # fair visual comparison. The slope from fitting log(nu_collapsed_scaled) vs log(s(L_O))
+    # will still be ~1 if the theory is correct.
     scale_mask = (
         np.isfinite(measured_collapsed)
         & np.isfinite(s_L_O_all)
